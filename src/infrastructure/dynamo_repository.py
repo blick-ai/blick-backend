@@ -1,9 +1,19 @@
 import concurrent.futures
+import time
 
 import boto3
 
 from domain.entities import Captura
 from domain.ports import ICapturaRepository
+
+
+# Varredura paralela: a particao da plantacao tem milhares de itens pesados
+# (contornos por planta). Ler tudo em sequencia levava ~15 s; em segmentos
+# paralelos o tempo cai quase na proporcao do numero de segmentos.
+SEGMENTOS_VARREDURA = 8
+# Total e pontos do mapa mudam so quando entra captura nova (o cache e
+# limpo em save/update/delete); o TTL cobre outras tasks do Fargate.
+TTL_CACHE_SEGUNDOS = 60
 
 
 class DynamoCapturaRepository(ICapturaRepository):
@@ -13,6 +23,7 @@ class DynamoCapturaRepository(ICapturaRepository):
 
     def save(self, captura: Captura) -> None:
         self._table.put_item(Item=captura.to_dynamo_item())
+        self._limpar_cache()
 
     def get(self, plantacao_id: str, timestamp: str, captura_id: str) -> Captura | None:
         pk = f"PLANT#{plantacao_id}"
@@ -25,6 +36,7 @@ class DynamoCapturaRepository(ICapturaRepository):
         pk = f"PLANT#{plantacao_id}"
         sk = f"CAPTURA#{timestamp}#{captura_id}"
         self._table.delete_item(Key={"PK": pk, "SK": sk})
+        self._limpar_cache()
 
     def update(self, captura: Captura) -> None:
         # put_item sobrescreve o item inteiro — como Captura.to_dynamo_item()
@@ -32,6 +44,42 @@ class DynamoCapturaRepository(ICapturaRepository):
         # como cliente_id e coordenadas), isso funciona tanto pra criar
         # quanto pra atualizar sem precisar de um UpdateExpression separado.
         self._table.put_item(Item=captura.to_dynamo_item())
+        self._limpar_cache()
+
+    def _cache(self) -> dict:
+        # setdefault no __dict__: funciona mesmo se o objeto for criado sem __init__ (testes)
+        return self.__dict__.setdefault("_cache_dados", {})
+
+    def _limpar_cache(self) -> None:
+        self._cache().clear()
+
+    def _cache_ler(self, chave):
+        entrada = self._cache().get(chave)
+        if entrada and time.monotonic() - entrada[0] < TTL_CACHE_SEGUNDOS:
+            return entrada[1]
+        return None
+
+    def _cache_gravar(self, chave, valor) -> None:
+        self._cache()[chave] = (time.monotonic(), valor)
+
+    def _varrer_paralelo(self, **kwargs_base) -> list[tuple[list[dict], int]]:
+        """Scan em SEGMENTOS_VARREDURA segmentos ao mesmo tempo.
+        Devolve [(itens, contagem)] por segmento."""
+
+        def _segmento(indice: int) -> tuple[list[dict], int]:
+            kw = dict(kwargs_base, Segment=indice, TotalSegments=SEGMENTOS_VARREDURA)
+            itens, contagem = [], 0
+            while True:
+                resposta = self._table.scan(**kw)
+                itens.extend(resposta.get("Items", []))
+                contagem += resposta.get("Count", 0)
+                if "LastEvaluatedKey" not in resposta:
+                    break
+                kw["ExclusiveStartKey"] = resposta["LastEvaluatedKey"]
+            return itens, contagem
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=SEGMENTOS_VARREDURA) as ex:
+            return list(ex.map(_segmento, range(SEGMENTOS_VARREDURA)))
 
     def list_by_status(
         self, status: str, plantacao_id: str = "plantacao-mock-001", limit: int = 50
@@ -160,24 +208,74 @@ class DynamoCapturaRepository(ICapturaRepository):
         return capturas_da_pagina, total
 
     def _contar_total(self, key_condition, expr_values, filter_expression, expr_names):
+        chave = ("total", key_condition, filter_expression,
+                 tuple(sorted(expr_values.items())))
+        em_cache = self._cache_ler(chave)
+        if em_cache is not None:
+            return em_cache
+
+        # a key condition vira parte do filtro do Scan (PK/SK aceitos em filtro de Scan)
+        filtro = f"({key_condition})"
+        if filter_expression:
+            filtro += f" AND ({filter_expression})"
         kwargs = {
-            "KeyConditionExpression": key_condition,
+            "FilterExpression": filtro,
             "ExpressionAttributeValues": expr_values,
             "Select": "COUNT",
         }
-        if filter_expression:
-            kwargs["FilterExpression"] = filter_expression
         if expr_names:
             kwargs["ExpressionAttributeNames"] = expr_names
 
-        total = 0
-        while True:
-            response = self._table.query(**kwargs)
-            total += response["Count"]
-            if "LastEvaluatedKey" not in response:
-                break
-            kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        total = sum(contagem for _, contagem in self._varrer_paralelo(**kwargs))
+        self._cache_gravar(chave, total)
         return total
+
+    def list_pontos_mapa(
+        self,
+        plantacao_id: str,
+        status_geral: str | None = None,
+        fl_treino: int | None = None,
+    ) -> list[dict]:
+        """Pontos enxutos pro mapa: so captura_id, timestamp, coordenadas e
+        status_geral sao lidos/trafegados (sem contornos, sem desserializar
+        Captura). Mais recentes primeiro."""
+        chave = ("mapa", plantacao_id, status_geral, fl_treino)
+        em_cache = self._cache_ler(chave)
+        if em_cache is not None:
+            return em_cache
+
+        valores = {":pk": f"PLANT#{plantacao_id}", ":pref": "CAPTURA#"}
+        filtros = ["PK = :pk", "begins_with(SK, :pref)"]
+        if status_geral:
+            filtros.append("ia_nuvem.status_geral = :sg")
+            valores[":sg"] = status_geral
+        if fl_treino is not None:
+            if fl_treino == 0:
+                filtros.append("(attribute_not_exists(fl_treino) OR fl_treino = :flt)")
+            else:
+                filtros.append("fl_treino = :flt")
+            valores[":flt"] = fl_treino
+
+        segmentos = self._varrer_paralelo(
+            FilterExpression=" AND ".join(filtros),
+            ExpressionAttributeValues=valores,
+            ExpressionAttributeNames={"#ts": "timestamp"},
+            ProjectionExpression="captura_id, #ts, coordenadas, ia_nuvem.status_geral",
+        )
+        pontos = []
+        for itens, _ in segmentos:
+            for it in itens:
+                coord = it.get("coordenadas") or {}
+                pontos.append({
+                    "captura_id": it["captura_id"],
+                    "timestamp": it["timestamp"],
+                    "latitude": coord.get("latitude"),
+                    "longitude": coord.get("longitude"),
+                    "status_geral": (it.get("ia_nuvem") or {}).get("status_geral"),
+                })
+        pontos.sort(key=lambda x: x["timestamp"], reverse=True)
+        self._cache_gravar(chave, pontos)
+        return pontos
 
     def list_cliente_ids(self) -> list[str]:
         cliente_ids: set[str] = set()
