@@ -59,6 +59,7 @@ def test_sem_fl_treino_nao_filtra_nada():
 
 
 def test_contagem_roda_em_varredura_paralela_e_vai_pro_cache():
+    pytest.importorskip("boto3")
     from infrastructure.dynamo_repository import SEGMENTOS_VARREDURA
 
     repo = _repo(itens_scan=[{"x": 1}, {"x": 2}])
@@ -73,6 +74,7 @@ def test_contagem_roda_em_varredura_paralela_e_vai_pro_cache():
 
 
 def test_escrita_limpa_o_cache_da_contagem():
+    pytest.importorskip("boto3")
     from infrastructure.dynamo_repository import SEGMENTOS_VARREDURA
 
     repo = _repo(itens_scan=[{"x": 1}])
