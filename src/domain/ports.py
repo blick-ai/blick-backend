@@ -66,6 +66,17 @@ class ICapturaRepository(ABC):
         ...
 
     @abstractmethod
+    def list_pontos_mapa(
+        self,
+        plantacao_id: str,
+        status_geral: Optional[str] = None,
+        fl_treino: Optional[int] = None,
+    ) -> list[dict]:
+        """Pontos leves pro mapa (captura_id, timestamp, latitude, longitude,
+        status_geral), mais recentes primeiro, sem carregar o item inteiro."""
+        ...
+
+    @abstractmethod
     def list_cliente_ids(self) -> list[str]:
         ...
 

@@ -425,33 +425,30 @@ class ListMapaCapturasUseCase:
         status_geral: str | None = None,
         limite: int = LIMITE_PONTOS_MAPA,
     ) -> dict:
-        capturas, _ = self._repository.list_by_plantacao(
+        itens = self._repository.list_pontos_mapa(
             plantacao_id=plantacao_id,
             status_geral=status_geral,
-            pagina=1,
-            tamanho_pagina=limite + 1,
             fl_treino=0,  # mapa acompanha a listagem: sem fotos de treino/validacao
         )
 
-        if len(capturas) > limite:
+        if len(itens) > limite:
             raise MapaLimiteExcedidoError(
                 f"Mais de {limite} pontos para o mapa. Use o filtro statusGeral."
             )
 
         pontos = []
-        for c in capturas:
-            lat, lon = c.coordenadas.latitude, c.coordenadas.longitude
+        for it in itens:
+            lat, lon = it["latitude"], it["longitude"]
             if lat is None or lon is None:
                 continue
 
-            ia = c.ia_nuvem or {}
             pontos.append(
                 {
-                    "captura_id": c.captura_id,
-                    "timestamp": c.timestamp,
+                    "captura_id": it["captura_id"],
+                    "timestamp": it["timestamp"],
                     "latitude": round(float(lat), 6),
                     "longitude": round(float(lon), 6),
-                    "status_geral": ia.get("status_geral"),
+                    "status_geral": it["status_geral"],
                 }
             )
 
